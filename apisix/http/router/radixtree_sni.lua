@@ -30,6 +30,7 @@ local ngx_decode_base64 = ngx.decode_base64
 local ssl_certificates
 local radixtree_router
 local radixtree_router_ver
+local prefix = ngx.config.prefix()
 
 
 local _M = {
@@ -108,6 +109,39 @@ local function create_router(ssl_items)
     return router
 end
 
+local function read_file(path)
+    local file, err = io.open(path, "rb") -- r read mode and b binary mode
+    if not file then
+        return nil, err
+    end
+
+    local content = file:read("*a")  -- *a or *all reads the whole file
+    file:close()
+    return content, nil
+end
+
+local function cert_value_parse(cert)
+    local file_path, str_cert
+    local err = nil
+    -- if cert is read from file,file_path must length lt 128
+    if #cert < 128 then
+        local tmp = str_find(cert, "/")
+        if tmp == nil then
+            file_path = prefix .. "conf/" .. cert
+            str_cert, err = read_file(file_path)
+            if str_cert then
+                return str_cert, nil   
+            end
+        else 
+            str_cert, err = read_file(cert)
+            if str_cert then
+                return str_cert, nil   
+            end
+        end
+        return cert, "read failed:" .. err
+    end
+    return cert, err
+end
 
 local function set_pem_ssl_key(cert, pkey)
     local r = get_request()
@@ -115,7 +149,12 @@ local function set_pem_ssl_key(cert, pkey)
         return false, "no request found"
     end
 
-    local parse_cert, err = ngx_ssl.parse_pem_cert(cert)
+    local cert_value, err = cert_value_parse(cert)
+    if err then
+        return false, "failed to get cert value: " .. err
+    end
+
+    local parse_cert, err = ngx_ssl.parse_pem_cert(cert_value)
     if parse_cert then
         local ok, err = ngx_ssl.set_cert(parse_cert)
         if not ok then

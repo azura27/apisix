@@ -507,7 +507,7 @@ _M.ssl = {
     properties = {
         id = id_schema,
         cert = {
-            type = "string", minLength = 128, maxLength = 64*1024
+            type = "string", minLength = 1, maxLength = 64*1024
         },
         key = {
             type = "string", minLength = 128, maxLength = 64*1024
