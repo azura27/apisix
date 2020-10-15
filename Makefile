@@ -48,8 +48,10 @@ help: default
 .PHONY: deps
 deps: default
 ifeq ($(LUAROCKS_VER),luarocks 3.)
+	yum install libffi-devel discount  automake libtool -y
 	luarocks install --lua-dir=$(LUAJIT_DIR) rockspec/apisix-master-0.rockspec --tree=deps --only-deps --local
 else
+	yum install libffi-devel discount  automake libtool -y
 	luarocks install rockspec/apisix-master-0.rockspec --tree=deps --only-deps --local
 endif
 

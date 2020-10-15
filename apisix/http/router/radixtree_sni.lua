@@ -30,6 +30,8 @@ local ngx_decode_base64 = ngx.decode_base64
 local ssl_certificates
 local radixtree_router
 local radixtree_router_ver
+local prefix = ngx.config.prefix()
+local alien = require "alien"
 
 
 local _M = {
@@ -71,13 +73,15 @@ local function create_router(ssl_items)
             end
 
             -- decrypt private key
-            if aes_128_cbc_with_iv ~= nil and
-                not str_find(ssl.value.key, "---") then
-                local decrypted = aes_128_cbc_with_iv:decrypt(ngx_decode_base64(ssl.value.key))
-                if decrypted == nil then
-                    core.log.error("decrypt ssl key failed. key[", ssl.value.key, "] ")
-                else
-                    ssl.value.key = decrypted
+            if ssl.value.key then
+                if aes_128_cbc_with_iv ~= nil and
+                    not str_find(ssl.value.key, "---") then
+                    local decrypted = aes_128_cbc_with_iv:decrypt(ngx_decode_base64(ssl.value.key))
+                    if decrypted == nil then
+                        core.log.error("decrypt ssl key failed. key[", ssl.value.key, "] ")
+                    else
+                        ssl.value.key = decrypted
+                    end
                 end
             end
 
@@ -108,7 +112,38 @@ local function create_router(ssl_items)
     return router
 end
 
+local function read_file(path)
+    local file, err = io.open(path, "rb") -- r read mode and b binary mode
+    if not file then
+        return nil, err
+    end
 
+    local content = file:read("*a")  -- *a or *all reads the whole file
+    file:close()
+    return content, nil
+end
+
+local function cert_value_parse(cert)
+    local file_path, str_cert
+    local err = nil
+    -- if cert is read from file,file_path must length lt 128
+    if #cert < 128 then
+        local tmp = str_find(cert, "/")
+        if tmp == nil then
+            file_path = prefix .. "conf/" .. cert
+            str_cert, err = read_file(file_path)
+            if str_cert then
+                return str_cert, nil   
+            end
+        else 
+            str_cert, err = read_file(cert)
+            return str_cert, err 
+        end
+        return cert, err
+    end
+    return cert, err
+end
+ 
 local function set_pem_ssl_key(cert, pkey)
     local r = get_request()
     if r == nil then
@@ -117,7 +152,12 @@ local function set_pem_ssl_key(cert, pkey)
 
     ngx_ssl.clear_certs()
 
-    local parse_cert, err = ngx_ssl.parse_pem_cert(cert)
+    local cert_value, err = cert_value_parse(cert)
+    if err then
+        return false, "failed to get cert value: " .. err
+    end
+
+    local parse_cert, err = ngx_ssl.parse_pem_cert(cert_value)
     if parse_cert then
         local ok, err = ngx_ssl.set_cert(parse_cert)
         if not ok then
@@ -140,6 +180,107 @@ local function set_pem_ssl_key(cert, pkey)
     return true
 end
 
+local function iter(config_array)
+    return function(config_array, i)
+        i = i + 1 
+        local elem_to_test = config_array[i]
+        if elem_to_test == nil then -- n + 1
+            return nil
+        end
+
+        local elem_to_test_name, elem_to_test_value = string.match(elem_to_test, "^([^:]+):*([^:,]+)$")    
+        if elem_to_test_value == "" then 
+            elem_to_test_value = nil
+        end
+        return i, elem_to_test_name, elem_to_test_value
+    end, config_array, 0
+end
+
+local function split(str, reps)
+    local input = tostring(str)
+    local delimiter = tostring(reps)
+    if (delimiter=='') then return false end
+    local pos, arr, index = 0, {}, 1
+    for st, sp in function() return string.find(input, delimiter, pos, true) end do
+        arr[index] = string.sub(input, pos, st - 1)
+        pos = sp + 1
+        index = index + 1
+    end
+    arr[index] = string.sub(input, pos)
+    return arr
+end
+
+local function keyless_parse(config)
+    local err = nil
+    local config_sub = string.sub(config, #"keyless:" + 1)
+    local ret = {}
+    -- trasverse config table
+    local conf_arr = split(config_sub, '|')
+    for _, key, value in iter(conf_arr) do
+        if key == "host" then
+            ret["remote_host"] = value
+        elseif key == "port" then
+            ret["remote_port"] = tonumber(value)
+            if ret["remote_port"] <= 0 then
+                err = "remote port with wrong format"
+            end
+        elseif key == "uri" then
+            ret["remote_uri"] = value
+        elseif key == "key_name" then
+            ret["key_name"] = value
+        elseif key == "auth_token" then
+            ret["auth_token"] = value
+        elseif key == "cert_path" then
+            ret["cert_path"] = prefix .. value
+        elseif key == "cache_path" then
+            ret["cache_path"] = prefix .. value
+        elseif key == "cache_valid_sec" then
+            ret["cache_valid_sec"] = tonumber(value)
+            if ret["cache_valid_sec"] <= 0 then
+                err = "cache_valid_sec with invalid value"
+            end
+        elseif key == "save_cache" then
+            ret["save_cache"] = tonumber(value)
+        end
+    end
+    return ret, err
+end
+
+local function set_pem_ssl_key_remote(certfile, set)
+    local r = get_request()
+    if r == nil then
+        return false, "no request found"
+    end
+
+    -- call for dynamic lib
+    local libpath = prefix .. "conf/https_key_loader.so"
+    if #libpath > 1024 then
+        return false, "dynamic loader lib CANNOT load for the libpath too long"
+    end
+    local libloader = alien.load(libpath)
+    local p, st, s, u, i, us = "pointer", "size_t", "string", "uint", "int", "ushort"
+    local def = alien.default
+    local buf = alien.buffer(16384)
+
+    libloader.lua_https_key_loader:types(i, s, s, s, s, s, s, us, u, i, p, st, p, st)
+    local result = libloader.lua_https_key_loader(set.cache_path, set.cert_path, set.remote_uri, set.key_name, set.auth_token, set.remote_host, set.remote_port, set.cache_valid_sec, set.save_cache, buf:topointer(), 16384, nil, 0)
+    if result <= 0 then
+        return false, "load https key failed"
+    end
+
+    local key_local = tostring(buf)
+    local cert_local, err = read_file(set.cache_path)
+    if err then
+        return false, "read cert file failed!"
+    end
+
+    local ok, err = set_pem_ssl_key(cert_local, key_local)
+    if not ok then
+        return false, err
+    end
+
+    return true
+end
 
 function _M.match_and_set(api_ctx)
     local err
@@ -195,10 +336,31 @@ function _M.match_and_set(api_ctx)
 
     local matched_ssl = api_ctx.matched_ssl
     core.log.info("debug - matched: ", core.json.delay_encode(matched_ssl, true))
-    ok, err = set_pem_ssl_key(matched_ssl.value.cert, matched_ssl.value.key)
-    if not ok then
-        return false, err
-    end
+
+    if matched_ssl.value.key then
+        ok, err = set_pem_ssl_key(matched_ssl.value.cert, matched_ssl.value.key)
+        if not ok then
+            return false, err
+        end
+    else
+        -- parse string value of loader
+        local setting, err = keyless_parse(matched_ssl.value.loader)
+        if err then
+            return false, err
+        end
+        if not setting["cert_path"] then
+            setting["cert_path"] = prefix .. "conf/" .. matched_ssl.value.cert
+        end 
+
+        if setting["cert_path"] == setting["cache_path"] then
+            return false, "cache path for key and cert CANNOT be the same!!"
+        end 
+        if not setting["save_cache"] then
+            setting["save_cache"] = 1
+        end 
+
+        return set_pem_ssl_key_remote(matched_ssl.value.cert, setting)
+    end 
 
     return true
 end

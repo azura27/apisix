@@ -445,11 +445,11 @@ _M.route = {
         {required = {"service_id", "uris"}},
         {required = {"script", "uri"}},
         {required = {"script", "uris"}},
-    },
-    ["not"] = {
-        anyOf = {
-            {required = {"script", "plugins"}}
-        }
+        },
+        ["not"] = {
+             anyOf = {
+                 {required = {"script", "plugins"}}
+            }
     },
     additionalProperties = false,
 }
@@ -500,10 +500,15 @@ _M.ssl = {
     properties = {
         id = id_schema,
         cert = {
-            type = "string", minLength = 128, maxLength = 64*1024
+            type = "string", minLength = 1, maxLength = 64*1024
         },
         key = {
             type = "string", minLength = 128, maxLength = 64*1024
+        },
+        loader = {
+            description = "key loader enabled",
+            type = "string",
+            minLength = 8, maxLength = 2*1024
         },
         sni = {
             type = "string",
@@ -529,7 +534,9 @@ _M.ssl = {
     },
     oneOf = {
         {required = {"sni", "key", "cert"}},
-        {required = {"snis", "key", "cert"}}
+        {required = {"snis", "key", "cert"}},
+        {required = {"sni", "loader", "cert"}},
+        {required = {"snis", "loader", "cert"}}
     },
     additionalProperties = false,
 }
