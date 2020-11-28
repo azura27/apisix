@@ -28,3 +28,6 @@ apisix:
       key: edd1c9f034335f136f87ad84b625c8f1 # using fixed API token has security risk, please
                                             # update it when you deploy to production environment
       role: admin
+nginx_config:                     # config for render the template to genarate nginx.conf
+  http:
+    access_log_format: '$pid $qiyi_client_ip - "$remote_user" [$time_iso8601] "$service" "$upstream_rs" "$request_scheme" "$host" "$request" $status $bytes_sent "$http_x_forwarded_for" "$http_referer" "$http_user_agent" "$request_time" "$apisix_rewrite_time" "$apisix_access_time" "$apisix_access_router_time" "$apisix_access_blancer_exec_time" "$upstream_response_time" "$uid" "$identifier" "$blacklist_3rd_party" "$traceId" "$is_traced" "$consumer_username"'

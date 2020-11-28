@@ -20,6 +20,8 @@ local error = error
 local tostring = tostring
 local ipairs = ipairs
 local pairs = pairs
+local str_find  = string.find
+local str_sub   = string.sub
 local upstreams
 
 
@@ -51,6 +53,21 @@ local function set_directly(ctx, key, ver, conf, parent)
 end
 _M.set = set_directly
 
+local function split_header(str, reps)
+    local input = tostring(str)
+    local delimiter = tostring(reps)
+    if (delimiter=='') then
+        return false
+    end
+    local start_str, start = {}, 1
+    local pos = str_find(input, delimiter, start, true)
+    if not pos then
+        return nil
+    end
+    start_str = str_sub (input, start, pos - 1)
+
+    return start_str
+end
 
 function _M.set_by_route(route, api_ctx)
     if api_ctx.upstream_conf then
@@ -63,7 +80,15 @@ function _M.set_by_route(route, api_ctx)
     if not up_conf then
         return false, "missing upstream configuration in Route or Service"
     end
-    -- core.log.info("up_conf: ", core.json.delay_encode(up_conf, true))
+    core.log.info("up_conf: ", core.json.delay_encode(up_conf, true))
+    -- find service name for maintainance
+    for i=1, #up_conf.nodes do
+        if up_conf.nodes[i].domain then
+            ngx.var.service = split_header(up_conf.nodes[i].domain, '.')
+            core.log.info("ngx.var.service: ", ngx.var.service)
+            break
+        end
+    end
 
     set_directly(api_ctx, up_conf.type .. "#upstream_" .. tostring(up_conf),
                  api_ctx.conf_version, up_conf, route)

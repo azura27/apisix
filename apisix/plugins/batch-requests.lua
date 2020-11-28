@@ -16,8 +16,8 @@
 --
 local core      = require("apisix.core")
 local http      = require("resty.http")
-local plugin    = require("apisix.plugin")
 local ngx       = ngx
+local io_open   = io.open
 local ipairs    = ipairs
 local pairs     = pairs
 local str_find  = string.find
@@ -28,20 +28,6 @@ local plugin_name = "batch-requests"
 
 local schema = {
     type = "object",
-    additionalProperties = false,
-}
-
-local default_max_body_size = 1024 * 1024 -- 1MiB
-local metadata_schema = {
-    type = "object",
-    properties = {
-        max_body_size = {
-            description = "max pipeline body size in bytes",
-            type = "integer",
-            exclusiveMinimum = 0,
-            default = default_max_body_size,
-        },
-    },
     additionalProperties = false,
 }
 
@@ -109,8 +95,7 @@ local _M = {
     version = 0.1,
     priority = 4010,
     name = plugin_name,
-    schema = schema,
-    metadata_schema = metadata_schema,
+    schema = schema
 }
 
 
@@ -193,46 +178,51 @@ local function set_common_query(data)
 end
 
 
-local function batch_requests(ctx)
-    local metadata = plugin.plugin_metadata(plugin_name)
-    core.log.info("metadata: ", core.json.delay_encode(metadata))
-
-    local max_body_size
-    if metadata then
-        max_body_size = metadata.value.max_body_size
-    else
-        max_body_size = default_max_body_size
+local function get_file(file_name)
+    local f = io_open(file_name, 'r')
+    if f then
+        local req_body = f:read("*all")
+        f:close()
+        return req_body
     end
 
-    local req_body, err = core.request.get_body(max_body_size, ctx)
-    if err then
-        -- Nginx doesn't support 417: https://trac.nginx.org/nginx/ticket/2062
-        -- So always return 413 instead
-        return 413, { error_msg = err }
-    end
+    return
+end
+
+
+local function batch_requests()
+    ngx.req.read_body()
+    local req_body = ngx.req.get_body_data()
     if not req_body then
-        return 400, {
-            error_msg = "no request body, you should give at least one pipeline setting"
-        }
+        local file_name = ngx.req.get_body_file()
+        if file_name then
+            req_body = get_file(file_name)
+        end
+
+        if not req_body then
+            core.response.exit(400, {
+                error_msg = "no request body, you should give at least one pipeline setting"
+            })
+        end
     end
 
     local data, err = core.json.decode(req_body)
     if not data then
-        return 400, {
+        core.response.exit(400, {
             error_msg = "invalid request body: " .. req_body .. ", err: " .. err
-        }
+        })
     end
 
     local code, body = check_input(data)
     if code then
-        return code, body
+        core.response.exit(code, body)
     end
 
     local httpc = http.new()
     httpc:set_timeout(data.timeout)
     local ok, err = httpc:connect("127.0.0.1", ngx.var.server_port)
     if not ok then
-        return 500, {error_msg = "connect to apisix failed: " .. err}
+        core.response.exit(500, {error_msg = "connect to apisix failed: " .. err})
     end
 
     ensure_header_lowercase(data)
@@ -241,7 +231,7 @@ local function batch_requests(ctx)
 
     local responses, err = httpc:request_pipeline(data.pipeline)
     if not responses then
-        return 400, {error_msg = "request failed: " .. err}
+        core.response.exit(400, {error_msg = "request failed: " .. err})
     end
 
     local aggregated_resp = {}
@@ -262,7 +252,7 @@ local function batch_requests(ctx)
         end
         core.table.insert(aggregated_resp, sub_resp)
     end
-    return 200, aggregated_resp
+    core.response.exit(200, aggregated_resp)
 end
 
 

@@ -26,8 +26,8 @@ LUAROCKS_VER ?= $(shell luarocks --version | grep -E -o  "luarocks [0-9]+.")
 
 SHELL := /bin/bash -o pipefail
 
-VERSION ?= latest
-RELEASE_SRC = apache-apisix-${VERSION}-src
+VERSION ?= 2.0.1
+RELEASE_SRC = apisix-qlb-${VERSION}
 
 .PHONY: default
 default:
@@ -52,8 +52,10 @@ help: default
 .PHONY: deps
 deps: default
 ifeq ($(LUAROCKS_VER),luarocks 3.)
+	yum install libffi-devel discount  automake libtool -y
 	luarocks install --lua-dir=$(LUAJIT_DIR) rockspec/apisix-master-0.rockspec --tree=deps --only-deps --local
 else
+	yum install libffi-devel discount  automake libtool -y
 	luarocks install rockspec/apisix-master-0.rockspec --tree=deps --only-deps --local
 endif
 
@@ -120,11 +122,16 @@ reload: default
 install: default
 	$(INSTALL) -d /usr/local/apisix/
 	$(INSTALL) -d /usr/local/apisix/logs/
+	$(INSTALL) -d /usr/local/apisix/lib/
 	$(INSTALL) -d /usr/local/apisix/conf/cert
+	$(INSTALL) -d /usr/local/apisix/conf/ssl
 	$(INSTALL) conf/mime.types /usr/local/apisix/conf/mime.types
+	$(INSTALL) lib/https_key_loader.so /usr/local/apisix/lib/https_key_loader.so
 	$(INSTALL) conf/config.yaml /usr/local/apisix/conf/config.yaml
 	$(INSTALL) conf/config-default.yaml /usr/local/apisix/conf/config-default.yaml
 	$(INSTALL) conf/cert/apisix.* /usr/local/apisix/conf/cert/
+	$(INSTALL) apisix/plugins/qiyi-waf/clib/*.so /usr/local/openresty/lualib/
+	cp -r deps /usr/local/apisix/
 
 	$(INSTALL) -d $(INST_LUADIR)/apisix
 	$(INSTALL) apisix/*.lua $(INST_LUADIR)/apisix/
@@ -165,6 +172,27 @@ install: default
 	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/skywalking
 	$(INSTALL) apisix/plugins/skywalking/*.lua $(INST_LUADIR)/apisix/plugins/skywalking/
 
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/qiyi-waf
+	$(INSTALL) apisix/plugins/qiyi-waf/*.lua $(INST_LUADIR)/apisix/plugins/qiyi-waf/
+
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/resty
+	$(INSTALL) apisix/plugins/qiyi-waf/wlib/resty/*.lua $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/resty
+
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/resty/core
+	$(INSTALL) apisix/plugins/qiyi-waf/wlib/resty/core/*.lua $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/resty/core
+
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/resty/dns
+	$(INSTALL) apisix/plugins/qiyi-waf/wlib/resty/dns/*.lua $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/resty/dns
+
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/waf
+	$(INSTALL) apisix/plugins/qiyi-waf/wlib/waf/*.lua $(INST_LUADIR)/apisix/plugins/qiyi-waf/wlib/waf
+
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/passport-auth
+	$(INSTALL) apisix/plugins/passport-auth/*.lua $(INST_LUADIR)/apisix/plugins/passport-auth/
+
+	$(INSTALL) -d $(INST_LUADIR)/apisix/plugins/rewrite
+	$(INSTALL) apisix/plugins/rewrite/*.lua $(INST_LUADIR)/apisix/plugins/rewrite/
+
 	$(INSTALL) -d $(INST_LUADIR)/apisix/ssl/router
 	$(INSTALL) apisix/ssl/router/*.lua $(INST_LUADIR)/apisix/ssl/router/
 
@@ -195,28 +223,30 @@ endif
 	.travis/openwhisk-utilities/scancode/scanCode.py --config .travis/ASF-Release.cfg ./
 
 release-src:
-	tar -zcvf $(RELEASE_SRC).tgz \
-	--exclude .github \
-	--exclude .git \
-	--exclude .gitattributes \
-	--exclude .idea \
-	--exclude .travis \
-	--exclude .gitignore \
-	--exclude .DS_Store \
-	--exclude benchmark \
-	--exclude doc \
-	--exclude kubernetes \
-	--exclude logos \
-	--exclude deps \
-	--exclude logs \
-	--exclude t \
-	--exclude release \
-	.
-
-	gpg --batch --yes --armor --detach-sig $(RELEASE_SRC).tgz
-	shasum -a 512 $(RELEASE_SRC).tgz > $(RELEASE_SRC).tgz.sha512
+	if [ -d "../$(RELEASE_SRC)" -o -f "$(RELEASE_SRC).tgz" ]; then \
+		echo "Conflict: please rename $(RELEASE_SRC) in ../ or $(RELEASE_SRC).tgz in ./"; \
+		exit 1; \
+	fi
+	mkdir -p ../$(RELEASE_SRC)
+	cp -r * ../$(RELEASE_SRC)
+	rm -rf \
+	../$(RELEASE_SRC)/.github \
+	../$(RELEASE_SRC)/.git \
+	../$(RELEASE_SRC)/.gitattributes \
+	../$(RELEASE_SRC)/.idea \
+	../$(RELEASE_SRC)/.travis \
+	../$(RELEASE_SRC)/.gitignore \
+	../$(RELEASE_SRC)/.DS_Store \
+	../$(RELEASE_SRC)/benchmark \
+	../$(RELEASE_SRC)/doc \
+	../$(RELEASE_SRC)/kubernetes \
+	../$(RELEASE_SRC)/logos \
+	../$(RELEASE_SRC)/deps \
+	../$(RELEASE_SRC)/logs \
+	../$(RELEASE_SRC)/t \
+	../$(RELEASE_SRC)/release
 
 	mkdir -p release
+	tar -zcvf $(RELEASE_SRC).tgz ../$(RELEASE_SRC)
 	mv $(RELEASE_SRC).tgz release/$(RELEASE_SRC).tgz
-	mv $(RELEASE_SRC).tgz.asc release/$(RELEASE_SRC).tgz.asc
-	mv $(RELEASE_SRC).tgz.sha512 release/$(RELEASE_SRC).tgz.sha512
+	rm -rf ../$(RELEASE_SRC)

@@ -26,17 +26,22 @@ local str_find         = string.find
 local aes              = require "resty.aes"
 local assert           = assert
 local str_gsub         = string.gsub
+local str_sub          = string.sub
+local str_len          = string.len
 local ngx_decode_base64 = ngx.decode_base64
+local prefix           = ngx.config.prefix()
+local alien            = require "alien"
+local io_open          = io.open
 local ssl_certificates
 local radixtree_router
 local radixtree_router_ver
 
 local cert_cache = core.lrucache.new {
-    ttl = 3600, count = 512,
+    ttl = 2 * 3600, count = 1024,
 }
 
 local pkey_cache = core.lrucache.new {
-    ttl = 3600, count = 512,
+    ttl = 2 * 3600, count = 1024,
 }
 
 
@@ -156,6 +161,17 @@ local function create_router(ssl_items)
     return router
 end
 
+local function read_file(path)
+    local file, err = io_open(path, "rb")
+    if not file then
+        return nil, err
+    end
+
+    local content = file:read("*a")
+    file:close()
+    return content, nil
+end
+
 
 local function set_pem_ssl_key(sni, cert, pkey)
     local r = get_request()
@@ -187,6 +203,125 @@ local function set_pem_ssl_key(sni, cert, pkey)
     return true
 end
 
+local function iter(config_array)
+    return function(config_array, i)
+        i = i + 1
+        local elem_to_test = config_array[i]
+        if elem_to_test == nil then
+            return nil
+        end
+
+        local elem_to_test_name, elem_to_test_value = string.match(elem_to_test, "^([^:]+):*([^:,]+)$")
+        if elem_to_test_value == "" then
+            elem_to_test_value = nil
+        end
+        return i, elem_to_test_name, elem_to_test_value
+    end, config_array, 0
+end
+
+local function split(str, reps)
+    local input = tostring(str)
+    local delimiter = tostring(reps)
+    if (delimiter=='') then
+        return false
+    end
+    local arr, start = {}, 1
+    while true do
+        local pos = str_find(input, delimiter, start, true)
+        if not pos then
+            break
+        end
+        table.insert (arr, str_sub (input, start, pos - 1))
+        start = pos + str_len (delimiter)
+    end
+    table.insert (arr, str_sub (input, start))
+
+    return arr
+end
+
+local function keyless_parse(config, cert)
+    local err = nil
+    local config_sub = str_sub(config, #"keyless:" + 1)
+    local ret = {}
+    -- trasverse config table
+    local conf_arr = split(config_sub, '|')
+    for _, key, value in iter(conf_arr) do
+        if key == "host" then
+            ret["remote_host"] = value
+        elseif key == "port" then
+            ret["remote_port"] = tonumber(value)
+            if ret["remote_port"] <= 0 then
+                err = "remote port with wrong format"
+            end
+        elseif key == "uri" then
+            ret["remote_uri"] = value
+        elseif key == "key_name" then
+            ret["key_name"] = value
+        elseif key == "auth_token" then
+            ret["auth_token"] = value
+        elseif key == "cert_path" then
+            ret["cert_path"] = prefix .. "conf/" .. value
+        elseif key == "cache_path" then
+            ret["cache_path"] = prefix .. "conf/ssl/" .. value
+        elseif key == "cache_valid_sec" then
+            ret["cache_valid_sec"] = tonumber(value)
+            if ret["cache_valid_sec"] <= 0 then
+                err = "cache_valid_sec with invalid value"
+            end
+        elseif key == "save_cache" then
+            ret["save_cache"] = tonumber(value)
+        end
+    end
+
+    if not ret["cert_path"] then
+        ret["cert_path"] = prefix .. "conf/" .. cert
+    end
+    if not ret["cache_path"] then
+        ret["cache_path"] = prefix .. "conf/ssl/" .. (ret["key_name"] or cert)
+    end
+
+    if not ret["save_cache"] then
+        ret["save_cache"] = 1
+    end
+
+    return ret, err
+end
+
+local function set_pem_ssl_key_remote(sni, set)
+    local r = get_request()
+    if r == nil then
+        return false, "no request found"
+    end
+
+    -- call for dynamic lib
+    local libpath = prefix .. "lib/https_key_loader.so"
+    if #libpath > 1024 then
+        return false, "dynamic loader lib CANNOT load for the libpath too long"
+    end
+    local libloader = alien.load(libpath)
+    local p, st, s, u, i, us = "pointer", "size_t", "string", "uint", "int", "ushort"
+    local def = alien.default
+    local buf = alien.buffer(16384)
+
+    libloader.lua_https_key_loader:types(i, s, s, s, s, s, s, us, u, i, p, st, p, st)
+    local result = libloader.lua_https_key_loader(set.cache_path, set.cert_path, set.remote_uri, set.key_name, set.auth_token, set.remote_host, set.remote_port, set.cache_valid_sec, set.save_cache, buf:topointer(), 16384, nil, 0)
+    if result <= 0 then
+        return false, "load https key failed"
+    end
+
+    local key_local = tostring(buf)
+    local cert_local, err = read_file(set.cert_path)
+    if err then
+        return false, "read cert file failed!"
+    end
+
+    local ok, err = set_pem_ssl_key(sni, cert_local, key_local)
+    if not ok then
+        return false, err
+    end
+
+    return true
+end
 
 function _M.match_and_set(api_ctx)
     local err
@@ -245,19 +380,44 @@ function _M.match_and_set(api_ctx)
 
     ngx_ssl.clear_certs()
 
-    ok, err = set_pem_ssl_key(sni, matched_ssl.value.cert,
+    if matched_ssl.value.key then
+        ok, err = set_pem_ssl_key(sni, matched_ssl.value.cert,
                               matched_ssl.value.key)
-    if not ok then
-        return false, err
+        if not ok then
+            return false, err
+        end
+    elseif matched_ssl.value.loader then
+        -- parse string value of loader
+        local setting, err = keyless_parse(matched_ssl.value.loader, matched_ssl.value.cert)
+        if err then
+            return false, err
+        end
+
+        return set_pem_ssl_key_remote(sni, setting)
     end
 
-    -- multiple certificates support.
-    if matched_ssl.value.certs then
+    -- TODO:multiple certificates support.
+    if matched_ssl.value.certs and matched_ssl.value.keys then
         for i = 1, #matched_ssl.value.certs do
             local cert = matched_ssl.value.certs[i]
             local key = matched_ssl.value.keys[i]
 
             ok, err = set_pem_ssl_key(sni, cert, key)
+            if not ok then
+                return false, err
+            end
+        end
+    elseif matched_ssl.value.certs and matched_ssl.value.loaders then
+        for i = 1, #matched_ssl.value.certs do
+            local cert = matched_ssl.value.certs[i]
+            local loader = matched_ssl.value.loaders[i]
+            -- parse string value of loader
+            local setitem, err = keyless_parse(loader, cert)
+            if err then
+                return false, err
+            end
+
+            ok, err = set_pem_ssl_key_remote(sni, setitem)
             if not ok then
                 return false, err
             end

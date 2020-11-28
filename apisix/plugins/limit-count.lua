@@ -17,6 +17,7 @@
 local limit_local_new = require("resty.limit.count").new
 local core = require("apisix.core")
 local plugin_name = "limit-count"
+local ipairs      = ipairs
 local limit_redis_cluster_new
 local limit_redis_new
 do
@@ -31,24 +32,30 @@ end
 local schema = {
     type = "object",
     properties = {
-        count = {type = "integer", minimum = 0},
-        time_window = {type = "integer",  minimum = 0},
+        second = {type = "integer", minimum = 1},
+        minute = {type = "integer",  minimum = 1},
+        hour = {type = "integer",  minimum = 1},
         key = {
             type = "string",
-            enum = {"remote_addr", "server_addr", "http_x_real_ip",
-                    "http_x_forwarded_for", "consumer_name"},
+            enum = {"qiyi_client_ip", "server_addr", "http_x_real_ip", "total",
+                    "http_x_forwarded_for", "consumer_name", "credential"},
+            default = "total",
         },
         rejected_code = {
             type = "integer", minimum = 200, maximum = 600,
-            default = 503
+            default = 429,
         },
         policy = {
             type = "string",
             enum = {"local", "redis", "redis-cluster"},
             default = "local",
+        },
+        fault_tolerant = {
+            type = "boolean",
+            default = true,
         }
     },
-    required = {"count", "time_window", "key"},
+    required = {"key"},
     dependencies = {
         policy = {
             oneOf = {
@@ -113,6 +120,30 @@ local _M = {
     schema = schema,
 }
 
+local function self_check(conf)
+    local ordered_periods = {"second", "minute", "hour"}
+    local has_value
+    local invalid_order
+
+    for i, v in ipairs(ordered_periods) do
+        if conf[v] then
+            has_value = true
+            for t = i, #ordered_periods do
+                if conf[ordered_periods[t]] and conf[ordered_periods[t]] < conf[v] then
+                    invalid_order = "The limit for " .. ordered_periods[t].. " cannot be lower than the limit for " .. v
+                end
+            end
+        end
+    end
+
+    if not has_value then
+      return false, "You need to set at least one limit: second, minute, hour"
+    elseif invalid_order then
+      return false, invalid_order
+    end
+
+    return true, nil
+end
 
 function _M.check_schema(conf)
     local ok, err = core.schema.check(schema, conf)
@@ -126,57 +157,141 @@ function _M.check_schema(conf)
         end
     end
 
+    ok, err = self_check(conf)
+    if not ok then
+        return false, err
+    end
+
     return true
 end
 
+local EXPIRATIONS = {
+  second = 1,
+  minute = 60,
+  hour = 3600,
+}
 
-local function create_limit_obj(conf)
-    core.log.info("create new limit-count plugin instance")
+local WINDOW = {
+  [1] = "second",
+  [60] = "minute",
+  [3600] = "hour",
+}
 
+local function create_limit_objs(conf)
+    core.log.info("create new limit-count plugin instances table")
+
+    local objtab = core.table.new(#EXPIRATIONS, 0)
+    local ordered_periods = {"second", "minute", "hour"}
+    local temp_obj, err
     if not conf.policy or conf.policy == "local" then
-        return limit_local_new("plugin-" .. plugin_name, conf.count,
-                               conf.time_window)
+        for i, v in ipairs(ordered_periods) do
+            if conf[v] then
+                temp_obj, err = limit_local_new("plugin-" .. plugin_name .. "-" .. v, conf[v],
+                                            EXPIRATIONS[v])
+                if not temp_obj then
+                    return nil, err
+                end
+                core.table.insert(objtab, temp_obj)
+            end
+        end
     end
 
     if conf.policy == "redis" then
-        return limit_redis_new("plugin-" .. plugin_name,
-                               conf.count, conf.time_window, conf)
+        for _, v in ipairs(ordered_periods) do
+            if conf[v] then
+                temp_obj, err = limit_redis_new("plugin-" .. plugin_name .. "-" .. v,
+                                           conf[v], EXPIRATIONS[v], conf)
+                if not temp_obj then
+                    return nil, err
+                end
+                core.table.insert(objtab, temp_obj)
+            end
+        end
     end
 
     if conf.policy == "redis-cluster" then
-        return limit_redis_cluster_new("plugin-" .. plugin_name, conf.count,
-                                       conf.time_window, conf)
+        for _, v in ipairs(ordered_periods) do
+            if conf[v] then
+                temp_obj, err = limit_redis_cluster_new("plugin-" .. plugin_name .. "-" .. v,
+                                           conf[v], EXPIRATIONS[v], conf)
+                if not temp_obj then
+                    return nil, err
+                end
+                core.table.insert(objtab, temp_obj)
+            end
+        end
     end
 
-    return nil
+    return objtab, nil
 end
 
 
+local function get_identifier(conf, ctx)
+    local identifier
+    if conf.key == "consumer_name" then
+        identifier = ctx.consumer and ctx.consumer_id
+        -- fallback to credential: passport set ngx.var.uid = credential
+        if not identifier and ngx.var.uid then
+            identifier = ngx.var.uid
+        end
+    elseif conf.key == "total" then
+        identifier = "total"
+    elseif conf.key == "credential" then
+        identifier = ctx.consumer.auth_conf.password or ctx.consumer.auth_conf.key
+    end
+
+    if not identifier then identifier = ngx.var.qiyi_client_ip end
+
+    return identifier
+end
+
 function _M.access(conf, ctx)
     core.log.info("ver: ", ctx.conf_version)
-    local lim, err = core.lrucache.plugin_ctx(plugin_name, ctx,
-                                              create_limit_obj, conf)
-    if not lim then
-        core.log.error("failed to fetch limit.count object: ", err)
-        return 500
+    local fault_tolerant = conf.fault_tolerant
+    local lims, err = core.lrucache.plugin_ctx(plugin_name, ctx,
+                                              create_limit_objs, conf)
+    if not lims then
+        core.log.error("failed to fetch limit.count object table: ", err)
+        if not fault_tolerant then
+            return 500, "failed to fetch limit.count object table"
+        end
     end
 
-    local key = (ctx.var[conf.key] or "") .. ctx.conf_type .. ctx.conf_version
+    local key
+    if conf.key == "credential" then
+        key = (ctx.consumer.auth_conf.password or ctx.consumer.auth_conf.key or "") .. ctx.conf_type .. ctx.conf_version
+    elseif conf.key == "total" then
+        key = "" .. ctx.conf_type .. ctx.conf_version
+    else
+        key = (ctx.var[conf.key] or "") .. ctx.conf_type .. ctx.conf_version
+    end
     core.log.info("limit key: ", key)
 
-    local delay, remaining = lim:incoming(key, true)
-    if not delay then
-        local err = remaining
-        if err == "rejected" then
-            return conf.rejected_code
+    local delay, remaining
+    local lim_key = {}
+    for i, lim in ipairs(lims) do
+        delay, remaining = lim:incoming(key, true)
+        if not delay then
+            local err = remaining
+            if err == "rejected" then
+                ngx.var.identifier = get_identifier(conf, ctx)
+                return conf.rejected_code, "API rate limit exceeded!!"
+            end
+
+            core.log.error("failed to limit req: ", err)
+            if not fault_tolerant then
+                return 500, {error_msg = "failed to limit count: " .. err}
+            end
         end
 
-        core.log.error("failed to limit req: ", err)
-        return 500, {error_msg = "failed to limit count: " .. err}
+        lim_key[WINDOW[lim.window]] = remaining
     end
 
-    core.response.set_header("X-RateLimit-Limit", conf.count,
-                             "X-RateLimit-Remaining", remaining)
+    for k, v in pairs(lim_key) do
+        core.response.set_header("X-RateLimit-Limit" .. "-" .. k, conf[k],
+                                 "X-RateLimit-Remaining" .. "-" .. k, v)
+    end
+
 end
 
 

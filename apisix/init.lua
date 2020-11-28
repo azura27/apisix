@@ -24,7 +24,9 @@ local admin_init    = require("apisix.admin.init")
 local get_var       = require("resty.ngxvar").fetch
 local router        = require("apisix.router")
 local set_upstream  = require("apisix.upstream").set_by_route
+local lua_resty_waf = require "apisix.plugins.qiyi-waf.waf"
 local ipmatcher     = require("resty.ipmatcher")
+local dns_client    = require("apisix.core.dns")
 local ngx           = ngx
 local get_method    = ngx.req.get_method
 local ngx_exit      = ngx.exit
@@ -37,10 +39,12 @@ local ngx_now       = ngx.now
 local str_byte      = string.byte
 local str_sub       = string.sub
 local load_balancer
-local local_conf
+local local_conf    = core.config.local_conf()
 local dns_resolver
 local lru_resolved_domain
 local ver_header    = "APISIX/" .. core.version.VERSION
+local iputils       = require "resty.iputils"
+local pl_string     = require "pl.stringx"
 
 
 local function parse_args(args)
@@ -49,9 +53,7 @@ local function parse_args(args)
     core.log.info("dns resolver", core.json.delay_encode(dns_resolver, true))
 end
 
-
 local _M = {version = 0.4}
-
 
 function _M.http_init(args)
     require("resty.core")
@@ -63,7 +65,6 @@ function _M.http_init(args)
     require("jit.opt").start("minstitch=2", "maxtrace=4000",
                              "maxrecord=8000", "sizemcode=64",
                              "maxmcode=4000", "maxirconst=1000")
-
     parse_args(args)
     core.id.init()
 
@@ -72,6 +73,11 @@ function _M.http_init(args)
     if not ok then
         core.log.error("failed to enable privileged_agent: ", err)
     end
+
+    lua_resty_waf.default_option("sync_delay", local_conf.nginx_config.waf_delay)
+    lua_resty_waf.default_option("sync_target_host", local_conf.nginx_config.waf_host)
+    lua_resty_waf.default_option("sync_target_port", local_conf.nginx_config.waf_port)
+    xpcall(function() lua_resty_waf.init("skywalker") end, function() ngx.log(ngx.ERR, debug.traceback()) end)
 end
 
 
@@ -83,7 +89,7 @@ function _M.http_init_worker()
     end
     math.randomseed(seed)
     -- for testing only
-    core.log.info("random test in [1, 10000]: ", math.random(1, 10000))
+    core.log.info("random test in [1, 10000]: ", math.random(1, 1000000))
 
     local we = require("resty.worker.events")
     local ok, err = we.configure({shm = "worker-events", interval = 0.1})
@@ -100,7 +106,13 @@ function _M.http_init_worker()
 
     router.http_init_worker()
     require("apisix.http.service").init_worker()
+
     plugin.init_worker()
+    local waf = require "apisix.plugins.qiyi-waf"
+    if waf and waf.init_worker then
+        waf.init_worker()
+    end
+
     require("apisix.consumer").init_worker()
 
     if core.config == require("apisix.core.config_yaml") then
@@ -110,6 +122,10 @@ function _M.http_init_worker()
     require("apisix.debug").init_worker()
     require("apisix.upstream").init_worker()
 
+    local dns_client, err = require("apisix.core.dns").setup_client()
+    if not dns_client then
+        core.log.error("failed to setup dns client, ", err)
+    end
     local_conf = core.config.local_conf()
     local dns_resolver_valid = local_conf and local_conf.apisix and
                         local_conf.apisix.dns_resolver_valid
@@ -176,25 +192,16 @@ function _M.http_ssl_phase()
     end
 end
 
-
 local function parse_domain(host)
-    local ip_info, err = core.utils.dns_parse(host)
-    if not ip_info then
-        core.log.error("failed to parse domain: ", host, ", error: ",err)
-        return nil, err
+    local ip, port = dns_client.toip(host)
+    if not ip then
+        core.log.error("failed to parse domain: ", host, ", error: ", port)
+        return nil, nil, port
     end
 
-    core.log.info("parse addr: ", core.json.delay_encode(ip_info))
-    core.log.info("resolver: ", core.json.delay_encode(dns_resolver))
-    core.log.info("host: ", host)
-    if ip_info.address then
-        core.log.info("dns resolver domain: ", host, " to ", ip_info.address)
-        return ip_info.address
-    else
-        return nil, "failed to parse domain"
-    end
+    core.log.info("dns resolver domain: ", host, " to ", ip, " port ", port)
+    return ip, port
 end
-
 
 local function parse_domain_for_nodes(nodes)
     local new_nodes = core.table.new(#nodes, 0)
@@ -202,11 +209,12 @@ local function parse_domain_for_nodes(nodes)
         local host = node.host
         if not ipmatcher.parse_ipv4(host) and
                 not ipmatcher.parse_ipv6(host) then
-            local ip, err = parse_domain(host)
+            local ip, port, err = parse_domain(host)
             if ip then
                 local new_node = core.table.clone(node)
                 new_node.host = ip
                 new_node.domain = host
+                new_node.port = port
                 core.table.insert(new_nodes, new_node)
             end
 
@@ -219,7 +227,6 @@ local function parse_domain_for_nodes(nodes)
     end
     return new_nodes
 end
-
 
 local function compare_upstream_node(old_t, new_t)
     if type(old_t) ~= "table" then
@@ -242,7 +249,6 @@ local function compare_upstream_node(old_t, new_t)
 
     return true
 end
-
 
 local function parse_domain_in_up(up)
     local nodes = up.value.nodes
@@ -321,6 +327,40 @@ local function set_upstream_host(api_ctx)
 end
 
 
+function _M.http_rewrite_phase()
+    ngx.ctx.APISIX_REWRITE_START = ngx_now() * 1000  --in milliseconds
+    if ngx.var.http_true_client_ip then
+        ngx.var.qiyi_client_ip = ngx.var.http_true_client_ip
+    else
+        local xff = ngx.var.http_x_forwarded_for
+        if xff then
+            local ips = pl_string.split(xff, ",")
+            local is_xff_valid = false
+            for _, v in ipairs(ips) do
+                if not iputils.ip_in_cidrs(v, iputils.parse_cidrs(local_conf.apisix.reserved_ip)) then
+                    ngx.var.qiyi_client_ip = v
+                    is_xff_valid = true
+                    break
+                end
+            end
+
+            if not is_xff_valid and ngx.var.http_ak_ghost_ip then
+                ngx.var.qiyi_client_ip = ngx.var.http_ak_ghost_ip
+            end
+        end
+    end
+
+    ngx.var.request_scheme = ngx.var.http_x_forwarded_proto or ngx.var.scheme
+
+    local waf = require "apisix.plugins.qiyi-waf"
+    if waf and waf.rewrite_by_lua then
+        waf.rewrite_by_lua()
+    end
+    ngx.ctx.APISIX_REWRITE_TIME = ngx_now() * 1000 - ngx.ctx.APISIX_REWRITE_START
+    ngx.var.apisix_rewrite_time = ngx.ctx.APISIX_REWRITE_TIME / 1000
+    ngx.ctx.APISIX_ACCESS_START = ngx_now() * 1000
+end
+
 function _M.http_access_phase()
     local ngx_ctx = ngx.ctx
     local api_ctx = ngx_ctx.api_ctx
@@ -368,11 +408,14 @@ function _M.http_access_phase()
         end
     end
 
+    ngx_ctx.APISIX_ACCESS_ROUTER_START = ngx_now() * 1000  --router match time
     local user_defined_route_matched = router.router_http.match(api_ctx)
     if not user_defined_route_matched then
         router.api.match(api_ctx)
     end
 
+    ngx_ctx.APISIX_ACCESS_ROUTER_END = ngx_now() * 1000
+    ngx.var.apisix_access_router_time = (ngx_ctx.APISIX_ACCESS_ROUTER_END - ngx_ctx.APISIX_ACCESS_ROUTER_START) / 1000
     local route = api_ctx.matched_route
     if not route then
         core.log.info("not find any matched route")
@@ -383,6 +426,7 @@ function _M.http_access_phase()
     core.log.info("matched route: ",
                   core.json.delay_encode(api_ctx.matched_route, true))
 
+    ngx_ctx.APISIX_ACCESS_BALANCER_EXEC_START = ngx_now() * 1000
     if route.value.service_protocol == "grpc" then
         return ngx.exec("@grpc_pass")
     end
@@ -432,6 +476,9 @@ function _M.http_access_phase()
                                                     upstream)
                 if err then
                     core.log.error("failed to get resolved upstream: ", err)
+                    if err == "dns server error: 3 name error" then
+                        return core.response.exit(503)
+                    end
                     return core.response.exit(500)
                 end
             end
@@ -452,10 +499,14 @@ function _M.http_access_phase()
     else
         if route.has_domain then
             local err
-            route, err = lru_resolved_domain(route, api_ctx.conf_version,
-                                             parse_domain_in_route, route)
+           -- route, err = lru_resolved_domain(route, api_ctx.conf_version,
+             --                                parse_domain_in_route, route)
+	    route, err = parse_domain_in_route(route)
             if err then
                 core.log.error("failed to get resolved route: ", err)
+		if err == "dns server error: 3 name error" then
+                    return core.response.exit(503)
+                end
                 return core.response.exit(500)
             end
 
@@ -476,6 +527,9 @@ function _M.http_access_phase()
                                     route.dns_value.upstream)
                                    or route_val.upstream
     end
+
+    ngx_ctx.APISIX_ACCESS_BALANCER_EXEC_END = ngx_now() * 1000
+    ngx.var.apisix_access_blancer_exec_time = (ngx_ctx.APISIX_ACCESS_BALANCER_EXEC_END - ngx_ctx.APISIX_ACCESS_BALANCER_EXEC_START) / 1000
 
     if enable_websocket then
         api_ctx.var.upstream_upgrade    = api_ctx.var.http_upgrade
@@ -512,6 +566,9 @@ function _M.http_access_phase()
     end
 
     set_upstream_host(api_ctx)
+
+    ngx_ctx.APISIX_ACCESS_TIME = ngx_now() * 1000 - ngx_ctx.APISIX_ACCESS_START
+    ngx.var.apisix_access_time = ngx_ctx.APISIX_ACCESS_TIME / 1000
 end
 
 
@@ -708,7 +765,6 @@ end
 
 
 local function cors_admin()
-    local_conf = core.config.local_conf()
     if local_conf.apisix and not local_conf.apisix.enable_admin_cors then
         return
     end
@@ -774,14 +830,13 @@ function _M.stream_init_worker()
     end
     math.randomseed(seed)
     -- for testing only
-    core.log.info("random stream test in [1, 10000]: ", math.random(1, 10000))
+    core.log.info("random stream test in [1, 10000]: ", math.random(1, 1000000))
 
     router.stream_init_worker()
     plugin.init_worker()
 
     load_balancer = require("apisix.balancer").run
 
-    local_conf = core.config.local_conf()
     local dns_resolver_valid = local_conf and local_conf.apisix and
                         local_conf.apisix.dns_resolver_valid
 

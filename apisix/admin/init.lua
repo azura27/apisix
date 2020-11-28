@@ -18,11 +18,13 @@ local require = require
 local core = require("apisix.core")
 local route = require("resty.radixtree")
 local plugin = require("apisix.plugin")
+local dns_client = require("apisix.core.dns")
 local ngx = ngx
 local get_method = ngx.req.get_method
 local tonumber = tonumber
 local str_lower = string.lower
 local reload_event = "/apisix/admin/plugins/reload"
+local dns_cache_event = "/apisix/admin/dns/cache/*"
 local ipairs = ipairs
 local events
 local MAX_REQ_BODY = 1024 * 1024 * 1.5      -- 1.5 MiB
@@ -259,6 +261,33 @@ local function reload_plugins(data, event, source, pid)
     plugin.load()
 end
 
+local function post_dns_cache()
+    local api_ctx = {}
+    core.ctx.set_vars_meta(api_ctx)
+
+    local ok, err = check_token(api_ctx)
+    if not ok then
+        core.log.warn("failed to check token: ", err)
+        core.response.exit(401)
+    end
+
+    local uri_segs = core.utils.split_uri(ngx.var.uri)
+    local seg_qname = uri_segs[6]
+    core.log.info("uri: ,", core.json.delay_encode(uri_segs), seg_qname)
+    local data = {
+        qname = seg_qname
+    }
+    local success, err = events.post("dns", "clean_cache", data)
+    if not success then
+        core.response.exit(500, err)
+    end
+    core.response.exit(200, success)
+end
+
+local function dns_cache_clean(data, event, source, pid)
+    core.log.info("start to clean dns cache")
+    dns_client.remove_cache(data.qname)
+end
 
 local uri_route = {
     {
@@ -281,6 +310,11 @@ local uri_route = {
         methods = {"PUT"},
         handler = post_reload_plugins,
     },
+    {
+        paths = dns_cache_event,
+        methods = {"DELETE"},
+        handler = post_dns_cache,
+    },
 }
 
 
@@ -294,6 +328,7 @@ function _M.init_worker()
     events = require("resty.worker.events")
 
     events.register(reload_plugins, reload_event, "PUT")
+    events.register(dns_cache_clean, "dns", "clean_cache")
 end
 
 

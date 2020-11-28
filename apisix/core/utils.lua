@@ -15,6 +15,7 @@
 -- limitations under the License.
 --
 local table    = require("apisix.core.table")
+local log      = require("apisix.core.log")
 local ngx_re   = require("ngx.re")
 local resolver = require("resty.dns.resolver")
 local ipmatcher= require("resty.ipmatcher")
@@ -84,7 +85,7 @@ local function dns_parse(domain, resolvers)
         return nil, "failed to instantiate the resolver: " .. err
     end
 
-    local answers, err = r:query(domain, nil, {})
+    local answers, err = r:tcp_query(domain, {qtype = r.TYPE_SRV})
     if not answers then
         return nil, "failed to query the DNS server: " .. err
     end
@@ -96,8 +97,24 @@ local function dns_parse(domain, resolvers)
 
     local idx = math.random(1, #answers)
     local answer = answers[idx]
-    if answer.type == 1 then
-        return answer
+    log.info("wrr dns parse answer: ", require("cjson").encode(answer))
+
+    if answer.type == 33 then
+        local port = answer.port
+        local answers, err = r:tcp_query(answer.target, { })
+        if not answers then
+            return nil, "failed to query the DNS server: " .. err
+        end
+        if answers.errcode then
+            return nil, "server returned error code: " .. answers.errcode
+                       .. ": " .. answers.errstr
+        end
+        local idx = math.random(1, #answers)
+        local ans = answers[idx]
+        if ans.type == 1 then
+	    answer.address = ans.address
+            return answer
+        end
     end
 
     if answer.type ~= 5 then

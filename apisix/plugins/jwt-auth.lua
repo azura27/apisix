@@ -31,13 +31,6 @@ local plugin_name = "jwt-auth"
 
 local schema = {
     type = "object",
-    additionalProperties = false,
-    properties = {},
-}
-
-local consumer_schema = {
-    type = "object",
-    additionalProperties = false,
     properties = {
         key = {type = "string"},
         secret = {type = "string"},
@@ -51,8 +44,7 @@ local consumer_schema = {
             type = "boolean",
             default = false
         }
-    },
-    required = {"key"},
+    }
 }
 
 
@@ -83,28 +75,20 @@ do
 end -- do
 
 
-function _M.check_schema(conf, schema_type)
+function _M.check_schema(conf)
     core.log.info("input conf: ", core.json.delay_encode(conf))
 
-    local ok, err
-    if schema_type == core.schema.TYPE_CONSUMER then
-        ok, err = core.schema.check(consumer_schema, conf)
-    else
-        ok, err = core.schema.check(schema, conf)
-    end
-
+    local ok, err = core.schema.check(schema, conf)
     if not ok then
         return false, err
     end
 
-    if schema_type == core.schema.TYPE_CONSUMER then
-        if not conf.secret then
-            conf.secret = ngx_encode_base64(resty_random.bytes(32, true))
-        end
+    if not conf.secret then
+        conf.secret = ngx_encode_base64(resty_random.bytes(32, true))
+    end
 
-        if not conf.exp then
-            conf.exp = 60 * 60 * 24
-        end
+    if not conf.exp then
+        conf.exp = 60 * 60 * 24
     end
 
     return true
@@ -192,6 +176,7 @@ function _M.rewrite(conf, ctx)
     ctx.consumer = consumer
     ctx.consumer_id = consumer.consumer_id
     ctx.consumer_ver = consumer_conf.conf_version
+    ngx.var.consumer_username = consumer.consumer_id
     core.log.info("hit jwt-auth rewrite")
 end
 

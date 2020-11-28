@@ -553,10 +553,15 @@ _M.ssl = {
     properties = {
         id = id_schema,
         cert = {
-            type = "string", minLength = 128, maxLength = 64*1024
+            type = "string", minLength = 1, maxLength = 64*1024
         },
         key = {
             type = "string", minLength = 128, maxLength = 64*1024
+        },
+        loader = {
+            description = "key loader enabled",
+            type = "string",
+            minLength = 8, maxLength = 2*1024
         },
         sni = {
             type = "string",
@@ -573,7 +578,7 @@ _M.ssl = {
             type = "array",
             items = {
                 type = "string",
-                minLength = 128,
+                minLength = 1,
                 maxLength = 64*1024,
             }
         },
@@ -583,6 +588,14 @@ _M.ssl = {
                 type = "string",
                 minLength = 128,
                 maxLength = 64*1024,
+            }
+        },
+        loaders = {
+            type = "array",
+            items = {
+                type = "string",
+                minLength = 8,
+                maxLength = 2*1024,
             }
         },
         exptime = {
@@ -610,7 +623,11 @@ _M.ssl = {
     },
     oneOf = {
         {required = {"sni", "key", "cert"}},
-        {required = {"snis", "key", "cert"}}
+        {required = {"snis", "key", "cert"}},
+        {required = {"sni", "loader", "cert"}},
+        {required = {"snis", "loader", "cert"}},
+        {required = {"sni", "loaders", "certs"}},
+        {required = {"snis", "loaders", "certs"}}
     },
     additionalProperties = false,
 }

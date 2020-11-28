@@ -250,6 +250,7 @@ local function pick_server(route, ctx)
         return core.response.exit(502)
     end
     ctx.server_picker = server_picker
+    ngx.var.upstream_rs = res.host .. ":" .. res.port
     return res
 end
 

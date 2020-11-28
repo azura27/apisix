@@ -86,6 +86,7 @@ function _M.rewrite(conf, ctx)
     ctx.consumer = consumer
     ctx.consumer_id = consumer.consumer_id
     ctx.consumer_ver = consumer_conf.conf_version
+    ngx.var.consumer_username = consumer.consumer_id
     core.log.info("hit key-auth rewrite")
 end
 

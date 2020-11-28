@@ -19,18 +19,35 @@ local new_tracer = require("opentracing.tracer").new
 local zipkin_codec = require("apisix.plugins.zipkin.codec")
 local new_random_sampler = require("apisix.plugins.zipkin.random_sampler").new
 local new_reporter = require("apisix.plugins.zipkin.reporter").new
+local local_conf = require("apisix.core.config_local").local_conf()
 local ngx = ngx
 local pairs = pairs
 local tonumber = tonumber
 
 local plugin_name = "zipkin"
 
+local ROVER_PROJECT_ID = local_conf.apisix.zipkin
+             and local_conf.apisix.zipkin.rover_project_id
+local ROVER_FRAMWORK_TYPE = local_conf.apisix.zipkin
+             and local_conf.apisix.zipkin.rover_framwork_type
+
 
 local schema = {
     type = "object",
     properties = {
-        endpoint = {type = "string"},
-        sample_ratio = {type = "number", minimum = 0.00001, maximum = 1},
+        host = {
+            type = "string",
+            default = "127.0.0.1",
+        },
+        port = {
+            type = "number",
+            default = 65521,
+        },
+        sample_ratio = {
+            type = "number",
+            minimum = 0.00001,
+            maximum = 1,
+        },
         service_name = {
             type = "string",
             description = "service name for zipkin reporter",
@@ -41,8 +58,16 @@ local schema = {
             description = "default is $server_addr, you can speific your external ip address",
             pattern = "^[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}$"
         },
+        timeout = {
+            default = 10000,
+            type = "number",
+        },
+        topic = {
+            type = "string",
+            default = "apigateway-rover",
+        },
     },
-    required = {"endpoint", "sample_ratio"}
+    required = {"host", "port", "sample_ratio", "topic"}
 }
 
 
@@ -84,18 +109,29 @@ local function create_tracer(conf,ctx)
     return tracer
 end
 
-local function report2endpoint(premature, reporter)
+local function report2endpoint(premature, conf, reporter)
     if premature then
         return
     end
 
-    local ok, err = reporter:flush()
+    local ok, err = reporter:flush(conf)
     if not ok then
         core.log.error("reporter flush ", err)
         return
     end
 
     core.log.info("report2endpoint ok")
+end
+
+-- Utility function to set either ipv4 or ipv6 tags
+-- nginx apis don't have a flag to indicate whether an address is v4 or v6
+local function ip_tag(addr)
+    -- use the presence of "." to signal v4 (v6 uses ":")
+    if addr:find(".", 1, true) then
+        return "peer.ipv4"
+    else
+        return "peer.ipv6"
+    end
 end
 
 
@@ -107,7 +143,6 @@ function _M.rewrite(plugin_conf, ctx)
     if not conf.server_addr or conf.server_addr == '' then
         conf.server_addr = ctx.var["server_addr"]
     end
-
     local tracer = core.lrucache.plugin_ctx(plugin_name .. '#' .. conf.server_addr, ctx,
                                             create_tracer, conf, ctx)
 
@@ -120,6 +155,7 @@ function _M.rewrite(plugin_conf, ctx)
                                         core.request.headers(ctx))
 
     local start_timestamp = ngx.req.start_time()
+    local forwarded_ip = core.request.get_remote_client_ip(ctx)
     local request_span = tracer:start_span("apisix.request", {
         child_of = wire_context,
         start_timestamp = start_timestamp,
@@ -128,9 +164,10 @@ function _M.rewrite(plugin_conf, ctx)
             ["span.kind"] = "server",
             ["http.method"] = ctx.var.request_method,
             ["http.url"] = ctx.var.request_uri,
-             -- TODO: support ipv6
-            ["peer.ipv4"] = core.request.get_remote_client_ip(ctx),
+            [ip_tag(forwarded_ip)] = forwarded_ip,
             ["peer.port"] = core.request.get_remote_client_port(ctx),
+            ["rover.project.id"] = ROVER_PROJECT_ID,
+            ["rover.framework.type"] = ROVER_FRAMWORK_TYPE,
         }
     })
 
@@ -139,8 +176,8 @@ function _M.rewrite(plugin_conf, ctx)
         wire_context = wire_context,
         request_span = request_span,
         rewrite_span = nil,
-        access_span = nil,
-        proxy_span = nil,
+        access_span = nil, --access stage interval
+        proxy_span = nil, --response--upstream + body/header filter
     }
 
     local request_span = ctx.opentracing.request_span
@@ -148,6 +185,8 @@ function _M.rewrite(plugin_conf, ctx)
                                             "apisix.rewrite", start_timestamp)
 
     ctx.REWRITE_END_TIME = tracer:time()
+    ctx.opentracing.rewrite_span:set_tag("rover.project.id", ROVER_PROJECT_ID)
+    ctx.opentracing.rewrite_span:set_tag("rover.framework.type", ROVER_FRAMWORK_TYPE)
     ctx.opentracing.rewrite_span:finish(ctx.REWRITE_END_TIME)
 end
 
@@ -164,6 +203,8 @@ function _M.access(conf, ctx)
     local tracer = opentracing.tracer
 
     ctx.ACCESS_END_TIME = tracer:time()
+    opentracing.access_span:set_tag("rover.project.id", ROVER_PROJECT_ID)
+    opentracing.access_span:set_tag("rover.framework.type", ROVER_FRAMWORK_TYPE)
     opentracing.access_span:finish(ctx.ACCESS_END_TIME)
 
     opentracing.proxy_span = opentracing.request_span:start_child_span(
@@ -199,15 +240,22 @@ function _M.log(conf, ctx)
     local opentracing = ctx.opentracing
 
     local log_end_time = opentracing.tracer:time()
+    opentracing.body_filter_span:set_tag("rover.project.id", ROVER_PROJECT_ID)
+    opentracing.body_filter_span:set_tag("rover.framework.type", ROVER_FRAMWORK_TYPE)
     opentracing.body_filter_span:finish(log_end_time)
 
     local upstream_status = core.response.get_upstream_status(ctx)
     opentracing.request_span:set_tag("http.status_code", upstream_status)
+    opentracing.request_span:set_tag("rover.project.id", ROVER_PROJECT_ID)
+    opentracing.request_span:set_tag("rover.framework.type", ROVER_FRAMWORK_TYPE)
+
+    opentracing.proxy_span:set_tag("rover.project.id", ROVER_PROJECT_ID)
+    opentracing.proxy_span:set_tag("rover.framework.type", ROVER_FRAMWORK_TYPE)
     opentracing.proxy_span:finish(log_end_time)
     opentracing.request_span:finish(log_end_time)
 
     local reporter = opentracing.tracer.reporter
-    local ok, err = ngx.timer.at(0, report2endpoint, reporter)
+    local ok, err = ngx.timer.at(0, report2endpoint, conf, reporter)
     if not ok then
         core.log.error("failed to create timer: ", err)
     end

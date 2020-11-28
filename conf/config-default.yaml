@@ -93,10 +93,11 @@ apisix:
   #     - 9200
   #     - 9211
   # dns_resolver:                   # If not set, read from `/etc/resolv.conf`
-  #  - 1.1.1.1
+  #  - 10.48.177.33
   #  - 8.8.8.8
   dns_resolver_valid: 30          # valid time for dns result 30 seconds
   resolver_timeout: 5             # resolver timeout
+
   ssl:
     enable: true
     enable_http2: true
@@ -107,15 +108,24 @@ apisix:
                                             #  If set this, must be a string of length 16. And it will encrypt ssl key with AES-128-CBC
                                             #  !!! So do not change it after saving your ssl, it can't decrypt the ssl keys have be saved if you change !!
 #  discovery: eureka               # service discovery center
+  reserved_ip: "100.64.0.0/10"
+  changting_host: "waf-ct-agent-18e9bf91b-5.qiyi.virtual"
+  changting_port: "8000"
+  zipkin:
+    rover_project_id: "109672"
+    rover_framwork_type: "apisix-zipkin-plugins"
+    rover_service_name: "IQIYI-APISIX"
+    anonymous_reports: "off"
+    dc_name: "beijing_zjy"
 nginx_config:                     # config for render the template to genarate nginx.conf
   error_log: "logs/error.log"
   error_log_level: "warn"         # warn,error
-  worker_processes: auto          # one worker will get best performance, you can use "auto", but remember it is just work well only on physical machine
-                                  # no more than 8 workers, otherwise competition between workers will consume a lot of resources
-                                  # if you want use multiple cores in container, you can inject the number of cpu as environment variable "APIX_WORKER_PROCESSES"
-  enable_cpu_affinity: true       # enbale cpu affinity, this is just work well only on physical machine
+  worker_processes: auto
   worker_rlimit_nofile: 20480     # the number of files a worker process can open, should be larger than worker_connections
   worker_shutdown_timeout: 240s     # timeout for a graceful shutdown of worker processes
+  waf_host: "manager.waf.qiyi.domain"
+  waf_port: "80"
+  waf_delay: "300"
   event:
     worker_connections: 10620
   #envs:                            # allow to get a list of environment variables
@@ -157,6 +167,26 @@ etcd:
 #    send: 2000                    # default 2000ms
 #    read: 5000                    # default 5000ms
 
+dns:
+  dns_hostsfile: "/etc/hosts"
+  resolver:
+      # - "10.48.177.33:53"
+      - "10.128.242.182"
+  dns_error_ttl: 3000
+  dns_not_found_ttl: 3000
+  dns_stale_ttl: 3000
+  dns_order:
+      - "LAST"
+      - "SRV"
+      - "A"
+      - "CNAME"
+  dns_srv_suffixes:
+      - "query.consul-online"
+      - "service.consul"
+  dns_no_sync: false
+  cacheSize: 60000
+  node_type_ttl: 3600
+
 plugins:                          # plugin list
   - example-plugin
   - limit-req
@@ -196,6 +226,11 @@ plugins:                          # plugin list
   - proxy-mirror
   - request-id
   - hmac-auth
+  - qiyi-waf
+  - passport-auth
+  - blacklist-3rd-party
+  - api-mock
+  - rewrite
 
 stream_plugins:
   - mqtt-proxy

@@ -14,9 +14,11 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-local resty_http = require "resty.http"
+local ngx_socket_udp = ngx.socket.udp
 local to_hex = require "resty.string".to_hex
 local cjson = require "cjson".new()
+local local_conf = require("apisix.core.config_local").local_conf()
+local core = require("apisix.core")
 cjson.encode_number_precision(16)
 local assert = assert
 local type = type
@@ -36,15 +38,19 @@ local span_kind_map = {
     consumer = "CONSUMER",
 }
 
+local SERVICE_NAME = local_conf.apisix.zipkin
+             and local_conf.apisix.zipkin.rover_service_name
+
 
 function _M.new(conf)
-    local endpoint = conf.endpoint
+    local host = conf.host
+    local port = conf.port
     local service_name = conf.service_name
     local server_port = conf.server_port
     local server_addr = conf.server_addr
-    assert(type(endpoint) == "string", "invalid http endpoint")
     return setmetatable({
-        endpoint = endpoint,
+        host = host,
+        port = port,
         service_name = service_name,
         server_addr = server_addr,
         server_port = server_port,
@@ -56,7 +62,6 @@ end
 
 function _M.report(self, span)
     local span_context = span:context()
-
     local zipkin_tags = {}
     for k, v in span:each_tag() do
         -- Zipkin tag values should be strings
@@ -67,7 +72,7 @@ function _M.report(self, span)
     zipkin_tags["span.kind"] = nil
 
     local localEndpoint = {
-        serviceName = self.service_name,
+        serviceName = SERVICE_NAME,
         ipv4 = self.server_addr,
         port = self.server_port,
         -- TODO: ip/port from ngx.var.server_name/ngx.var.server_port?
@@ -79,7 +84,6 @@ function _M.report(self, span)
             zipkin_tags["peer.port"] = nil
             remoteEndpoint = {
                 ipv4 = zipkin_tags["peer.ipv4"],
-                -- ipv6 = zipkin_tags["peer.ipv6"],
                 port = peer_port, -- port is *not* optional
             }
             zipkin_tags["peer.ipv4"] = nil
@@ -108,34 +112,45 @@ function _M.report(self, span)
     local i = self.pending_spans_n + 1
     self.pending_spans[i] = zipkin_span
     self.pending_spans_n = i
+    ngx.var.is_traced = true
+    ngx.var.traceId = to_hex(span_context.trace_id)
 end
 
-function _M.flush(self)
+function _M.flush(self, conf)
     if self.pending_spans_n == 0 then
-
         return true
     end
 
-    local pending_spans = cjson.encode(self.pending_spans)
+    local udp_message = {}
+    -- venus udp format
+    udp_message["udp_topic"] = conf.topic
+    udp_message["message"] = self.pending_spans
+
+    local pending_spans = cjson.encode(udp_message)
+    core.log.info("udp_message send to venus:", pending_spans)
     self.pending_spans = {}
     self.pending_spans_n = 0
 
-    local httpc = resty_http.new()
-    local res, err = httpc:request_uri(self.endpoint, {
-        method = "POST",
-        headers = {
-            ["content-type"] = "application/json",
-        },
-        body = pending_spans,
-    })
+    local sock = ngx_socket_udp()
+    sock:settimeout(conf.timeout)
 
-    -- TODO: on failure, retry?
-    if not res then
-        return nil, "failed to request: " .. err
-    elseif res.status < 200 or res.status >= 300 then
-        return nil, "failed: " .. res.status .. " " .. res.reason
+    local ok, err = sock:setpeername(conf.host, conf.port)
+    if not ok then
+        return nil, "[zipkin-reporter] could not connect to ", conf.host, ":", conf.port, ": ", err
     end
 
+    local ok, err
+    ok, err = sock:send(pending_spans)
+
+    if not ok then
+        return nil, "failed to send: " .. err
+    end
+
+    ok, err = sock:close()
+
+    if not ok then
+        return nil, "failed to close connection from " .. self.host .. ":" .. tostring(self.port) .. ": " .. err
+    end
     return true
 end
 

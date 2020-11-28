@@ -20,10 +20,40 @@ local aes               = require "resty.aes"
 local ngx_encode_base64 = ngx.encode_base64
 local type              = type
 local assert            = assert
+local str_find          = string.find
+local smatch            = string.match
+local prefix            = ngx.config.prefix()
+local io_open           = io.open
+local io_close          = io.close
 
 local _M = {
     version = 0.1,
 }
+
+local function file_exist(path)
+    local f = io_open(path, "r")
+    if f ~= nil then
+        io_close(f)
+        return true
+    end
+    return false
+end
+
+local function loader_check(loader)
+    local config_sub = string.sub(loader, #"keyless:" + 1)
+    local m = smatch(config_sub, "host:[^:|]+|port:[^:|]+|uri:[^:|]+|key_name:[^:|]+|auth_token:[^:|]+|cache_path:([^:|]+)")
+    if not m then
+        return nil, "loader patern match failed"
+    end
+    local fold_path = smatch(prefix .. "conf/ssl/" .. m, "(.+)/[^/]+")
+    --core.log.warn("table value:", fold_path)
+
+    if file_exist(fold_path) then
+        return true, nil
+    else
+        return false, "fold path not exist"
+    end
+end
 
 
 local function check_conf(id, conf, need_id)
@@ -55,8 +85,26 @@ local function check_conf(id, conf, need_id)
 
     local numcerts = conf.certs and #conf.certs or 0
     local numkeys = conf.keys and #conf.keys or 0
-    if numcerts ~= numkeys then
+    local numloaders = conf.loaders and #conf.loaders or 0
+    if numcerts ~= numkeys and numcerts ~= numloaders then
         return nil, {error_msg = "mismatched number of certs and keys"}
+    end
+
+
+    if conf.loader then
+        --core.log.warn("loader check function called")
+        local ok, err = loader_check(conf.loader)
+        if not ok then
+            return nil, {error_msg = err}
+        end
+    elseif conf.loaders and #conf.loaders then
+        for i = 1, #conf.loaders do
+            local item = conf.loaders[i]
+            local ok, err = loader_check(item)
+            if not ok then
+                return nil, {error_msg = err}
+            end
+        end
     end
 
     return need_id and id or true
@@ -94,7 +142,9 @@ function _M.put(id, conf)
     end
 
     -- encrypt private key
-    conf.key = aes_encrypt(conf.key)
+    if conf.key then
+        conf.key = aes_encrypt(conf.key)
+    end
 
     if conf.keys then
         for i = 1, #conf.keys do
@@ -141,7 +191,9 @@ function _M.post(id, conf)
     end
 
     -- encrypt private key
-    conf.key = aes_encrypt(conf.key)
+    if conf.key then
+        conf.key = aes_encrypt(conf.key)
+    end
 
     if conf.keys then
         for i = 1, #conf.keys do
